@@ -58,7 +58,7 @@ class Pool:
                 if codigo != 200:
                     raise ValueError(f"Resposta do servidor: {estado}")
                 self.atualizar_trabalho(estado["trabalho"])
-                time.sleep(0.5)
+                time.sleep(0.2)  # rodadas curtas: quanto antes o trabalho novo chega, melhor
             except (URLError, OSError, ValueError, KeyError) as erro:
                 print(f"Servidor principal indisponível: {erro}. Nova tentativa em 2 segundos.")
                 with self.trava:
@@ -91,42 +91,65 @@ class Pool:
 
     def lote(self, dados):
         nome = dados.get("trabalhador")
+        quantidade = dados.get("quantidade", self.tamanho_lote)
         if not nome_valido(nome):
             return 400, {"erro": "Informe um nome de trabalhador de 1 a 60 caracteres."}
+        if type(quantidade) is not int or not 1 <= quantidade <= 2**36:
+            return 400, {"erro": "A quantidade de nonces deve estar entre 1 e 2**36."}
         with self.trava:
             self.ultimo_contato[nome] = time.monotonic()
             trabalho = self.trabalho_aberto()
             if trabalho is None:
                 return 503, {"erro": "Pool sem trabalho no momento."}
             inicio = self.proximo_nonce
-            self.proximo_nonce += self.tamanho_lote
+            self.proximo_nonce += quantidade
             return 200, {
                 "trabalho": trabalho,
                 "minerador": self.nome,
                 "dificuldade_share": self.dificuldade_share(trabalho),
                 "inicio": inicio,
-                "fim": inicio + self.tamanho_lote,
+                "fim": inicio + quantidade,
             }
 
     def share(self, dados):
-        nome, nonce = dados.get("trabalhador"), dados.get("nonce")
-        if not nome_valido(nome) or type(nonce) is not int or not 0 <= nonce < 2**64:
+        """Recebe uma share ("nonce") ou várias ("nonces").
+
+        O trabalhador pode declarar uma "dificuldade" maior que a mínima do pool: cada
+        zero a mais exige 16 vezes mais hashes, então a share vale 16 vezes mais.
+        """
+        nome = dados.get("trabalhador")
+        nonces = dados.get("nonces", [dados.get("nonce")])
+        if (not nome_valido(nome) or not isinstance(nonces, list) or not 0 < len(nonces) <= 1000
+                or any(type(n) is not int or not 0 <= n < 2**64 for n in nonces)):
             return 400, {"erro": "Share malformada."}
         with self.trava:
             self.ultimo_contato[nome] = time.monotonic()
             trabalho = self.trabalho_aberto()
             if trabalho is None or dados.get("id") != trabalho["id"]:
                 return 409, {"erro": "Share de um trabalho que já terminou."}
-            if nonce in self.vistos:
-                return 409, {"erro": "Share repetida."}
-            digest = hash_bloco(trabalho, self.nome, nonce)
-            if not digest.startswith("0" * self.dificuldade_share(trabalho)):
-                return 400, {"erro": "Share inválida."}
-            self.vistos.add(nonce)
-            self.shares_rodada[nome] += 1
-            self.shares_total[nome] += 1
-            if not digest.startswith("0" * trabalho["dificuldade"]):
-                return 201, {"bloco": False}
+            minima = self.dificuldade_share(trabalho)
+            dificuldade = dados.get("dificuldade", minima)
+            if type(dificuldade) is not int or not minima <= dificuldade <= trabalho["dificuldade"]:
+                return 400, {"erro": f"A dificuldade da share deve estar entre {minima} e {trabalho['dificuldade']}."}
+            peso = 16 ** (dificuldade - minima)
+            aceitas = 0
+            solucao = None
+            for nonce in nonces:
+                if nonce in self.vistos:
+                    continue
+                digest = hash_bloco(trabalho, self.nome, nonce)
+                if not digest.startswith("0" * dificuldade):
+                    continue
+                self.vistos.add(nonce)
+                aceitas += 1
+                self.shares_rodada[nome] += peso
+                self.shares_total[nome] += peso
+                if digest.startswith("0" * trabalho["dificuldade"]):
+                    solucao = nonce
+                    break
+            if solucao is None:
+                return 201, {"aceitas": aceitas, "bloco": False}
+            nonce = solucao
             self.resolvido = trabalho["id"]
             participacao = self.shares_rodada.copy()
             self.shares_rodada.clear()
@@ -151,7 +174,7 @@ class Pool:
             else:
                 # Outro minerador venceu a rodada: as shares continuam valendo para o próximo bloco.
                 self.shares_rodada.update(participacao)
-        return 201, {"bloco": True, "aceito": aceito}
+        return 201, {"aceitas": aceitas, "bloco": True, "aceito": aceito}
 
     def estatisticas(self):
         with self.trava:
@@ -195,7 +218,7 @@ class Manipulador(BaseHTTPRequestHandler):
             return
         try:
             tamanho = int(self.headers.get("Content-Length", 0))
-            if not 0 < tamanho <= 4096:
+            if not 0 < tamanho <= 65536:
                 raise ValueError
             dados = json.loads(self.rfile.read(tamanho))
             if not isinstance(dados, dict):
@@ -214,7 +237,7 @@ def main():
     parser.add_argument("--servidor", required=True, help="Servidor principal. Ex.: http://192.168.1.10:8001")
     parser.add_argument("--nome", required=True, help="Nome com que o pool aparece no servidor principal")
     parser.add_argument("--porta", type=int, default=8002, help="Porta em que os trabalhadores se conectam")
-    parser.add_argument("--folga", type=int, default=2,
+    parser.add_argument("--folga", type=int, default=4,
                         help="Quantos zeros a menos uma share exige em relação ao bloco")
     parser.add_argument("--lote", type=int, default=200_000, help="Quantidade de nonces por lote")
     args = parser.parse_args()
